@@ -35,14 +35,14 @@ fármaco de esos factores.
 
 ```
 bigquery/
-  01_cohort.sql               -- población + exclusiones (Fig 1 del paper)
-  02_exposure.sql              -- beta-bloqueador en primeras 24h
+  01_cohort.sql                 -- población + exclusiones (Fig 1 del paper)
+  02_exposure.sql               -- beta-bloqueador en primeras 24h
   03_outcome.sql                -- AKI (KDIGO) después de la hora 24
   04_covariates.sql             -- confusores basales (Tabla 1 del paper)
   05_build_analysis_table.sql   -- tabla final de análisis
 python/
   01_analysis.py                -- imputación, PSM, regresión, subgrupos
-sql/                             -- versiones equivalentes en PostgreSQL
+sql/                            -- versiones equivalentes en PostgreSQL
                                      (por si en algún momento vuelves a Postgres)
 ```
 
@@ -69,9 +69,9 @@ sql/                             -- versiones equivalentes en PostgreSQL
 
 ## Limitaciones (heredadas del paper original, aplican igual aquí)
 
-- Es un estudio observacional: PSM ajusta por confusores **medidos**, no por
+- Es un estudio observacional: PSM ajusta por confusores medidos, no por
   confusión no medida (ej. decisiones clínicas no registradas en texto libre).
-- Los resultados del paper solo fueron significativos **después** de PSM, lo
+- Los resultados del paper solo fueron significativos después de PSM, lo
   cual el propio artículo discute como posible desenmascaramiento del efecto
   al balancear grupos — pero también es una señal de que el resultado es
   sensible a la especificación del modelo. Vale la pena que hagas la misma
