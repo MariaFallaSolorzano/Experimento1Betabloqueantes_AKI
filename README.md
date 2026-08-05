@@ -7,7 +7,7 @@ usando MIMIC-IV v3.1 en BigQuery, siguiendo la estructura de pipeline del
 tutorial [`mimic-iv-aline-study`](https://github.com/alistairewj/mimic-iv-aline-study).
 
 # Proceso de Inferencia causal basado en el marco de Rubin
-## 1.Pregunta causal
+## 1. Pregunta causal
 
 **¿El uso temprano (primeras 24h de UCI) de beta-bloqueadores reduce el riesgo
 de AKI en pacientes sépticos, comparado con no usarlos?**
