@@ -1,0 +1,113 @@
+Embudo de selección de la cohorte — consultas paso a paso
+Cada bloque de abajo es una consulta independiente y completa: cópiala y pégala sola en el editor de BigQuery, dale Run, y verás cuántos pacientes quedan después de aplicar ese criterio (acumulado sobre los anteriores). Todas corren sobre cohort_raw (que ya tiene cada exclusión precalculada como columna booleana) — no necesitas reconstruir nada.
+________________________________________
+Paso 0 — Sepsis-3, primera admisión a UCI, ≥18 años
+(equivalente al recuadro superior de la Fig 1 del paper, N=12,014)
+SELECT COUNT(*) AS n_paso_0_sepsis3_first_stay
+FROM `akiproject-489303.sa_aki_study.cohort_raw`;
+
+________________________________________
+Paso 1 — + excluir ICU < 24h
+SELECT COUNT(*) AS n_paso_1
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h;
+________________________________________
+Paso 2 — + excluir creatinina basal faltante
+SELECT COUNT(*) AS n_paso_2
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat;
+________________________________________
+Paso 3 — + excluir eGFR < 15 al ingreso
+SELECT COUNT(*) AS n_paso_3
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat
+  AND NOT excl_egfr_lt_15;
+________________________________________
+Paso 4 — + excluir RRT basal (primeras 24h)
+SELECT COUNT(*) AS n_paso_4
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat
+  AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline;
+________________________________________
+Paso 5 — + excluir AKI ya presente en las primeras 24h
+SELECT COUNT(*) AS n_paso_5
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat
+  AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline
+  AND NOT excl_aki_baseline;
+________________________________________
+Paso 6 — + excluir muerte en las primeras 24h
+SELECT COUNT(*) AS n_paso_6
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat
+  AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline
+  AND NOT excl_aki_baseline
+  AND NOT excl_death_24h;
+________________________________________
+Paso 7 (final) — + excluir sin mediciones para diagnosticar AKI
+Este número debe coincidir con SELECT COUNT(*) FROM cohort (la cohorte final).
+SELECT COUNT(*) AS n_paso_7_cohorte_final
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+  AND NOT excl_missing_creat
+  AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline
+  AND NOT excl_aki_baseline
+  AND NOT excl_death_24h
+  AND NOT excl_no_aki_measurement;
+________________________________________
+Todo el embudo de una sola vez (una fila por paso)
+Si prefieres correr una sola consulta y ver toda la tabla del embudo junta:
+SELECT 0 AS paso, 'sepsis3_first_stay' AS criterio, COUNT(*) AS n_restante
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+
+UNION ALL
+SELECT 1, '+ excl_icu_lt_24h', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h
+
+UNION ALL
+SELECT 2, '+ excl_missing_creat', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat
+
+UNION ALL
+SELECT 3, '+ excl_egfr_lt_15', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat AND NOT excl_egfr_lt_15
+
+UNION ALL
+SELECT 4, '+ excl_rrt_baseline', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline
+
+UNION ALL
+SELECT 5, '+ excl_aki_baseline', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline AND NOT excl_aki_baseline
+
+UNION ALL
+SELECT 6, '+ excl_death_24h', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline AND NOT excl_aki_baseline AND NOT excl_death_24h
+
+UNION ALL
+SELECT 7, '+ excl_no_aki_measurement (cohorte final)', COUNT(*)
+FROM `akiproject-489303.sa_aki_study.cohort_raw`
+WHERE NOT excl_icu_lt_24h AND NOT excl_missing_creat AND NOT excl_egfr_lt_15
+  AND NOT excl_rrt_baseline AND NOT excl_aki_baseline AND NOT excl_death_24h
+  AND NOT excl_no_aki_measurement
+
+ORDER BY paso;
+Esta última te da una tabla de 8 filas, cada una mostrando cuántos pacientes van quedando a medida que se acumula cada criterio — el equivalente visual directo de la Fig 1 del paper.
