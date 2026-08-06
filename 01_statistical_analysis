@@ -1,0 +1,369 @@
+"""
+01_analysis.py
+Replica el analisis estadistico de Wang, Hu & Song (2025), PLoS ONE, aplicado
+a la tabla de salida de sql/05_build_analysis_table.sql.
+
+Pasos (igual que el paper):
+  1. Carga de datos + resumen de missingness
+  2. Imputacion (random forest) para variables con <20% de datos faltantes;
+     se eliminan variables con >=20% de missing
+  3. Propensity score (regresion logistica) + matching 1:1 nearest-neighbor,
+     caliper = 0.018
+  4. Balance de covariables (SMD) antes y despues del matching
+  5. Regresion logistica: Modelo 1 (crudo) y Modelo 2 (ajustado, seleccion
+     stepwise de confusores)
+  6. Analisis de subgrupos (edad, sexo, comorbilidades, SAPS II/CCI)
+  7. Asociacion por tipo de beta-bloqueador
+
+Requiere: pandas, numpy, scipy, statsmodels, scikit-learn
+"""
+
+import numpy as np
+import pandas as pd
+from google.cloud import bigquery
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import NearestNeighbors
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+pd.set_option("display.width", 140)
+pd.set_option("display.max_columns", 50)
+
+# ----------------------------------------------------------------------------
+# 0. Config
+# ----------------------------------------------------------------------------
+PROJECT_ID = "akiproject-489303"
+ANALYSIS_TABLE = f"`{PROJECT_ID}.sa_aki_study.analysis_table`"
+CALIPER = 0.018
+MISSING_DROP_THRESHOLD = 0.20
+
+# Variables continuas y binarias que se usan como covariables / confusores
+CONTINUOUS_VARS = [
+    "age", "weight", "heart_rate", "systolic", "diastolic", "respiratory_rate",
+    "temperature", "spo2", "sofa", "sapsii", "cci", "creatinine", "bun",
+    "platelet", "wbc", "rdw", "hemoglobin", "hematocrit", "glucose", "calcium",
+    "bicarbonate", "sodium", "potassium", "chloride", "inr", "pt", "ptt",
+    "urine_output_24h", "egfr",
+]
+BINARY_VARS = [
+    "gender_male", "heart_failure", "ami", "ckd", "hypertension", "diabetes",
+    "ventilation", "vasopressor", "loop_diuretics", "nephrotoxic_antibiotics",
+    "cabg", "insulin", "platelet_infusion",
+]
+
+ALL_COVARS = CONTINUOUS_VARS + BINARY_VARS
+
+
+# ----------------------------------------------------------------------------
+# 1. Carga y limpieza basica
+# ----------------------------------------------------------------------------
+def load_data():
+    """
+    Requiere haberte autenticado antes con:
+        gcloud auth application-default login
+    (o correr esto desde un notebook de Colab/Vertex ya autenticado con tu
+    cuenta de PhysioNet-approved access).
+    """
+    client = bigquery.Client(project=PROJECT_ID)
+    query = f"SELECT * FROM {ANALYSIS_TABLE}"
+    df = client.query(query).to_dataframe()
+    df["gender_male"] = (df["gender"] == "M").astype(int)
+    return df
+
+
+def missingness_report(df, vars_):
+    miss = df[vars_].isna().mean().sort_values(ascending=False)
+    print("=== % de datos faltantes por variable ===")
+    print((miss * 100).round(1))
+    keep = miss[miss < MISSING_DROP_THRESHOLD].index.tolist()
+    dropped = miss[miss >= MISSING_DROP_THRESHOLD].index.tolist()
+    if dropped:
+        print(f"\nVariables eliminadas por >{MISSING_DROP_THRESHOLD*100:.0f}% missing: {dropped}")
+    return keep
+
+
+# ----------------------------------------------------------------------------
+# 2. Imputacion (random forest iterativo, analogo a missForest usado en R)
+# ----------------------------------------------------------------------------
+def impute_random_forest(df, vars_to_impute):
+    imputer = IterativeImputer(
+        estimator=RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        max_iter=10,
+        random_state=42,
+    )
+    imputed = imputer.fit_transform(df[vars_to_impute])
+    df_imputed = df.copy()
+    df_imputed[vars_to_impute] = imputed
+    return df_imputed
+
+
+# ----------------------------------------------------------------------------
+# 3. Propensity score + matching 1:1 nearest neighbor con caliper
+# ----------------------------------------------------------------------------
+def fit_propensity_score(df, covars, treatment="beta_blocker"):
+    X = sm.add_constant(df[covars])
+    y = df[treatment]
+    model = sm.Logit(y, X).fit(disp=False)
+    df = df.copy()
+    df["pscore"] = model.predict(X)
+    return df, model
+
+
+def nearest_neighbor_match(df, treatment="beta_blocker", caliper=CALIPER):
+    treated = df[df[treatment] == 1].copy()
+    control = df[df[treatment] == 0].copy()
+
+    nn = NearestNeighbors(n_neighbors=1)
+    nn.fit(control[["pscore"]])
+    distances, indices = nn.kneighbors(treated[["pscore"]])
+
+    matched_treated_idx = []
+    matched_control_idx = []
+    used_controls = set()
+
+    order = np.argsort(distances[:, 0])  # greedy: empareja primero los mas cercanos
+    for i in order:
+        dist = distances[i, 0]
+        ctrl_pos = indices[i, 0]
+        if dist > caliper:
+            continue
+        ctrl_idx = control.index[ctrl_pos]
+        if ctrl_idx in used_controls:
+            continue
+        used_controls.add(ctrl_idx)
+        matched_treated_idx.append(treated.index[i])
+        matched_control_idx.append(ctrl_idx)
+
+    matched = pd.concat([df.loc[matched_treated_idx], df.loc[matched_control_idx]])
+    print(f"\nMatched pairs: {len(matched_treated_idx)} "
+          f"(tratados disponibles: {len(treated)}, controles disponibles: {len(control)})")
+    return matched
+
+
+# ----------------------------------------------------------------------------
+# 4. Balance: standardized mean difference (SMD)
+# ----------------------------------------------------------------------------
+def smd_continuous(x1, x0):
+    m1, m0 = np.nanmean(x1), np.nanmean(x0)
+    s1, s0 = np.nanstd(x1, ddof=1), np.nanstd(x0, ddof=1)
+    pooled_sd = np.sqrt((s1**2 + s0**2) / 2)
+    return (m1 - m0) / pooled_sd if pooled_sd > 0 else np.nan
+
+
+def smd_binary(x1, x0):
+    p1, p0 = np.nanmean(x1), np.nanmean(x0)
+    pooled = np.sqrt((p1 * (1 - p1) + p0 * (1 - p0)) / 2)
+    return (p1 - p0) / pooled if pooled > 0 else np.nan
+
+
+def balance_table(df, covars_cont, covars_bin, treatment="beta_blocker"):
+    rows = []
+    t1 = df[df[treatment] == 1]
+    t0 = df[df[treatment] == 0]
+    for v in covars_cont:
+        rows.append((v, smd_continuous(t1[v], t0[v])))
+    for v in covars_bin:
+        rows.append((v, smd_binary(t1[v], t0[v])))
+    out = pd.DataFrame(rows, columns=["variable", "SMD"]).sort_values(
+        "SMD", key=np.abs, ascending=False
+    )
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 5. Regresion logistica: Modelo 1 (crudo) y Modelo 2 (ajustado)
+# ----------------------------------------------------------------------------
+def logistic_or(df, covars=None, treatment="beta_blocker", outcome="aki"):
+    if covars:
+        X = sm.add_constant(df[[treatment] + covars])
+    else:
+        X = sm.add_constant(df[[treatment]])
+    y = df[outcome]
+    model = sm.Logit(y, X).fit(disp=False)
+    or_ = np.exp(model.params[treatment])
+    ci = np.exp(model.conf_int().loc[treatment])
+    p = model.pvalues[treatment]
+    return {"OR": or_, "CI_low": ci[0], "CI_high": ci[1], "P": p}, model
+
+
+def stepwise_select(df, covars, treatment="beta_blocker", outcome="aki",
+                     p_enter=0.10, p_remove=0.10):
+    """Seleccion stepwise bidireccional simple sobre los confusores candidatos
+    (el tratamiento se fuerza a permanecer en el modelo)."""
+    included = []
+    candidates = list(covars)
+    changed = True
+    while changed:
+        changed = False
+        # forward step
+        best_p, best_var = 1.0, None
+        for v in candidates:
+            trial = included + [v]
+            X = sm.add_constant(df[[treatment] + trial])
+            model = sm.Logit(df[outcome], X).fit(disp=False)
+            p = model.pvalues[v]
+            if p < best_p:
+                best_p, best_var = p, v
+        if best_var is not None and best_p < p_enter:
+            included.append(best_var)
+            candidates.remove(best_var)
+            changed = True
+        # backward step
+        if included:
+            X = sm.add_constant(df[[treatment] + included])
+            model = sm.Logit(df[outcome], X).fit(disp=False)
+            worst_p = model.pvalues[included].max()
+            if worst_p > p_remove:
+                worst_var = model.pvalues[included].idxmax()
+                included.remove(worst_var)
+                changed = True
+    return included
+
+
+# ----------------------------------------------------------------------------
+# 6. Analisis de subgrupos
+# ----------------------------------------------------------------------------
+def subgroup_analysis(df, treatment="beta_blocker", outcome="aki"):
+    subgroups = {
+        "Age <65": df[df["age"] < 65],
+        "Age >=65": df[df["age"] >= 65],
+        "Female": df[df["gender_male"] == 0],
+        "Male": df[df["gender_male"] == 1],
+        "SAPSII < median": df[df["sapsii"] < df["sapsii"].median()],
+        "SAPSII >= median": df[df["sapsii"] >= df["sapsii"].median()],
+        "CCI < median": df[df["cci"] < df["cci"].median()],
+        "CCI >= median": df[df["cci"] >= df["cci"].median()],
+        "No comorbidities": df[(df["heart_failure"] == 0) & (df["ami"] == 0)
+                                & (df["ckd"] == 0) & (df["diabetes"] == 0)],
+        "Any comorbidity": df[(df["heart_failure"] == 1) | (df["ami"] == 1)
+                               | (df["ckd"] == 1) | (df["diabetes"] == 1)],
+    }
+    results = []
+    for name, sub in subgroups.items():
+        if sub[treatment].nunique() < 2 or sub[outcome].nunique() < 2:
+            continue
+        res, _ = logistic_or(sub, covars=None, treatment=treatment, outcome=outcome)
+        res["subgroup"] = name
+        res["n"] = len(sub)
+        results.append(res)
+    return pd.DataFrame(results)[["subgroup", "n", "OR", "CI_low", "CI_high", "P"]]
+
+
+# ----------------------------------------------------------------------------
+# 7. Tipo de beta-bloqueador
+# ----------------------------------------------------------------------------
+def bb_type_analysis(df_matched, outcome="aki"):
+    df = df_matched[df_matched["beta_blocker"] == 1].copy()
+    conditions = [
+        (df["bb_labetalol"] == 1) & (df["bb_metoprolol"] == 0) & (df["bb_esmolol"] == 0),
+        (df["bb_labetalol"] == 0) & (df["bb_metoprolol"] == 1) & (df["bb_esmolol"] == 0),
+        (df["bb_labetalol"] == 0) & (df["bb_metoprolol"] == 0) & (df["bb_esmolol"] == 1),
+    ]
+    choices = ["Labetalol", "Metoprolol", "Esmolol"]
+    df["bb_type"] = np.select(conditions, choices, default="More than two types")
+    print("\nDistribucion de tipos de beta-bloqueador:")
+    print(df["bb_type"].value_counts())
+    dummies = pd.get_dummies(df["bb_type"], drop_first=False)
+    df = pd.concat([df, dummies], axis=1)
+    return df
+
+
+# ----------------------------------------------------------------------------
+# 8. Analisis de sensibilidad: casos completos vs. datos imputados
+#    (equivalente a la Tabla S1 del paper original)
+# ----------------------------------------------------------------------------
+def sensitivity_complete_case_vs_imputed(df_raw, df_imputed, covars,
+                                          treatment="beta_blocker", outcome="aki"):
+    """
+    Compara el OR ajustado (Modelo 2) obtenido con:
+      (a) solo los pacientes SIN ningun dato faltante en las covariables
+          seleccionadas ("casos completos"), sin imputar nada; y
+      (b) el dataset completo, con missing imputado por random forest.
+
+    Si ambos OR apuntan en la misma direccion y con magnitudes/CI similares,
+    el resultado no depende fuertemente del supuesto de imputacion. Si
+    divergen (p.ej. cambia el signo o deja de ser significativo), es una
+    senal de que el hallazgo es sensible a como tratas los datos faltantes
+    -- y merece discutirse como limitacion, igual que hace el paper.
+    """
+    # (a) Casos completos: filas sin NINGUN NaN en las covariables + exposicion + outcome
+    complete_mask = df_raw[covars + [treatment, outcome]].notna().all(axis=1)
+    df_complete = df_raw[complete_mask].copy()
+    n_dropped = len(df_raw) - len(df_complete)
+    pct_dropped = 100 * n_dropped / len(df_raw)
+
+    print(f"\nCasos completos: {len(df_complete)} de {len(df_raw)} "
+          f"({pct_dropped:.1f}% descartados por tener al menos un dato faltante)")
+
+    # PS + matching + logistica, replicando el pipeline principal pero sobre
+    # el subconjunto de casos completos (sin imputar nada)
+    df_complete_ps, _ = fit_propensity_score(df_complete, covars, treatment)
+    matched_complete = nearest_neighbor_match(df_complete_ps)
+    or_complete, _ = logistic_or(matched_complete, covars=covars,
+                                  treatment=treatment, outcome=outcome)
+
+    # (b) Dataset imputado completo (el que ya vienes usando en el pipeline principal)
+    df_imputed_ps, _ = fit_propensity_score(df_imputed, covars, treatment)
+    matched_imputed = nearest_neighbor_match(df_imputed_ps)
+    or_imputed, _ = logistic_or(matched_imputed, covars=covars,
+                                 treatment=treatment, outcome=outcome)
+
+    result = pd.DataFrame([
+        {"analysis": "Casos completos (sin imputar)", "n": len(matched_complete),
+         **or_complete},
+        {"analysis": "Datos imputados (random forest)", "n": len(matched_imputed),
+         **or_imputed},
+    ])[["analysis", "n", "OR", "CI_low", "CI_high", "P"]]
+
+    print("\n=== Sensibilidad: casos completos vs. imputados ===")
+    print(result.to_string(index=False))
+    return result
+
+
+
+if __name__ == "__main__":
+    df = load_data()
+    print(f"N cargado: {len(df)}")
+
+    keep_vars = missingness_report(df, ALL_COVARS)
+    df_imp = impute_random_forest(df, keep_vars)
+
+    df_ps, ps_model = fit_propensity_score(df_imp, keep_vars)
+
+    print("\n=== Balance ANTES del matching ===")
+    bal_before = balance_table(df_ps, CONTINUOUS_VARS, BINARY_VARS)
+    print(bal_before.to_string(index=False))
+
+    matched = nearest_neighbor_match(df_ps)
+
+    print("\n=== Balance DESPUES del matching (SMD < 0.1 = aceptable) ===")
+    bal_after = balance_table(matched, CONTINUOUS_VARS, BINARY_VARS)
+    print(bal_after.to_string(index=False))
+
+    print("\n=== Modelo 1 (crudo), antes de PSM ===")
+    r1_before, _ = logistic_or(df_ps)
+    print(r1_before)
+
+    print("\n=== Modelo 1 (crudo), despues de PSM ===")
+    r1_after, _ = logistic_or(matched)
+    print(r1_after)
+
+    print("\nSeleccionando confusores por stepwise (esto puede tardar un poco)...")
+    selected = stepwise_select(matched, keep_vars)
+    print(f"Confusores retenidos: {selected}")
+
+    print("\n=== Modelo 2 (ajustado), despues de PSM ===")
+    r2_after, model2 = logistic_or(matched, covars=selected)
+    print(r2_after)
+
+    print("\n=== Analisis de subgrupos (post-PSM) ===")
+    sub_res = subgroup_analysis(matched)
+    print(sub_res.to_string(index=False))
+
+    print("\n=== Tipo de beta-bloqueador (post-PSM) ===")
+    bb_df = bb_type_analysis(matched)
+
+    print("\n=== Analisis de sensibilidad: casos completos vs. imputados ===")
+    sens_res = sensitivity_complete_case_vs_imputed(df, df_imp, selected)
